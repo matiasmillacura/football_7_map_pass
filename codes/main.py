@@ -19,7 +19,6 @@ import cv2
 import torch
 from configs.soccer import SoccerPitchConfiguration
 from configs.drawing import draw_pitch, draw_points_on_pitch
-from configs.view_transformer import ViewTransformer
 import torchreid
 from torchvision import transforms
 import os
@@ -95,13 +94,6 @@ def find_best_match(embedding, tracked_embeddings, threshold=0.8):
             best_score = similarity
     return best_match
 
-def get_video_frames_generator(video_path):
-    vr = VideoReader(video_path, ctx=cpu(0))  # Inicializar Decord VideoReader con CPU
-    for frame in vr:
-        yield frame.asnumpy()  # Convertir el frame a array de NumPy y devolverlo
-
-
-
 # Función para dibujar caja y texto
 def draw_player_box(frame, bbox, player_id, team_color):
     x1, y1, x2, y2 = map(int, bbox)
@@ -131,6 +123,17 @@ def draw_box(frame, bbox, label, color=(255, 0, 0)):
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
     cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
+def clean_detections(positions, distance_threshold):
+    """Limpia posiciones inconsistentes basadas en un umbral de distancia."""
+    if len(positions) == 0:
+        return []
+    filtered_positions = [positions[0]]  # Comenzar con la primera posición
+    for pos in positions[1:]:
+        distance = np.linalg.norm(np.array(pos) - np.array(filtered_positions[-1]))
+        if distance <= distance_threshold:
+            filtered_positions.append(pos)
+    return filtered_positions
+
 # Configuración de Decord para leer el video
 vr = VideoReader(VIDEO_PATH, ctx=cpu(0))
 frame_width, frame_height = vr[0].shape[1], vr[0].shape[0]
@@ -156,6 +159,9 @@ posiciones_df = pd.DataFrame(columns=['Frame', 'Id', 'Pos X', 'Pos Y', 'Ball X',
 
 # Inicializar contador de frames
 last_ball_position = [None, None]  # Última posición conocida del balón
+
+
+# Modificación del bucle principal
 for i, frame in tqdm(enumerate(vr), total=total_frames):
     frame = frame.asnumpy()
     frame_ball = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -168,6 +174,7 @@ for i, frame in tqdm(enumerate(vr), total=total_frames):
         overlap_filter_strategy=sv.OverlapFilter.NONE,
         slice_wh=(640, 640),
     )
+
     detections_result_ball = slicer(frame_ball).with_nms(threshold=0.05)
     detections_result_ball = ball_tracker.update(detections_result_ball)
     ball_detections = detections_result_ball[detections_result_ball.class_id == 0]
@@ -180,9 +187,13 @@ for i, frame in tqdm(enumerate(vr), total=total_frames):
         ball_detections.xyxy = ball_detections.xyxy[best_idx:best_idx+1]
         frame_ball_xy = ball_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
         pitch_ball_xy1 = view_transformer.transform_points(frame_ball_xy)
-        last_ball_position = [pitch_ball_xy1[0, 0], pitch_ball_xy1[0, 1]] if len(pitch_ball_xy1) > 0 else last_ball_position
+
+    # Limpiar posiciones del balón antes de usarlas
+    pitch_ball_xy1 = clean_detections(pitch_ball_xy1, distance_threshold=900)
 
     # Si no hay detección válida, mantener la última posición conocida
+    if len(pitch_ball_xy1) > 0:
+        last_ball_position = [pitch_ball_xy1[0][0], pitch_ball_xy1[0][1]]
     ball_x, ball_y = last_ball_position
 
     # --- 2. Detección de jugadores ---
@@ -192,6 +203,8 @@ for i, frame in tqdm(enumerate(vr), total=total_frames):
     frame_players_xy = players_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
     pitch_players_xy = view_transformer.transform_points(np.array(frame_players_xy)) if frame_players_xy is not None else []
 
+    # Limpiar posiciones de jugadores antes de usarlas
+    pitch_players_xy = clean_detections(pitch_players_xy, distance_threshold=500)
 
     # Diccionario de posiciones de jugadores
     players_positions = {}
@@ -234,22 +247,7 @@ for i, frame in tqdm(enumerate(vr), total=total_frames):
             label = f"Ball {confidence:.2f}"  # Etiqueta con confianza
             draw_box(frame, bbox, label, color=(0, 255, 255))  # Amarillo para el balón
 
-    # --- 7. Capturar posiciones en el DataFrame ---
-    rows = []
-    for match_id, player_position in players_positions.items():
-        team = player_teams.get(match_id, "UNKNOWN")
-        rows.append({
-            'Frame': i,
-            'Id': match_id,
-            'Pos X': player_position[0],
-            'Pos Y': player_position[1],
-            'Ball X': ball_x,
-            'Ball Y': ball_y,
-            'Team': team
-        })
-    posiciones_df = pd.concat([posiciones_df, pd.DataFrame(rows)], ignore_index=True)   
-
-    # --- 8. Dibujar radar táctico ---
+    # --- 7. Dibujar radar táctico ---
     pitch_players_black = np.array([pos for pid, pos in players_positions.items() if player_teams.get(pid) == "equipo_negro"])
     pitch_players_white = np.array([pos for pid, pos in players_positions.items() if player_teams.get(pid) == "equipo_blanco"])
 
@@ -260,7 +258,7 @@ for i, frame in tqdm(enumerate(vr), total=total_frames):
     # Redimensionar cancha_2d al tamaño del radar
     radar_resized = cv2.resize(cancha_2d, (radar_width, radar_height))
 
-    # --- 9. Crear un frame combinado con radar ---
+    # --- 8. Crear un frame combinado con radar ---
     frame_with_radar = frame.copy()
     x, y = radar_position
     alpha = 0.6  # Opacidad del radar
@@ -277,25 +275,9 @@ for i, frame in tqdm(enumerate(vr), total=total_frames):
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-#Guardar el DataFrame en un archivo Excel
-
+# Guardar el DataFrame en un archivo Excel
 input_file = "Posiciones-jugadores-balon.xlsx"
 posiciones_df.to_excel(input_file, index=False)
-
-
-#Limpieza de dataframe
-
-from postprocess import process_file
-
-# Ejecución del flujo completo
-process_file(
-    file_path=input_file,
-    cleaned_output_path='limpieza.xlsx',
-    output_possession_path='posesion.xlsx',
-    output_passes_path='pases.xlsx',
-    output_team_passes_path='passes_by_{team}.xlsx'
-)
-
 
 
 
